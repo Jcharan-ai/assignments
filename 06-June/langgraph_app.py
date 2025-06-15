@@ -12,9 +12,11 @@ from langchain.prompts import PromptTemplate
 from langchain_core.messages import BaseMessage
 from langchain_core.output_parsers import StrOutputParser, PydanticOutputParser
 from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
-from langchain_core.runnables import RunnablePassthrough
+from langchain_core.runnables import RunnablePassthrough, RunnableLambda
 from langchain_core.messages import HumanMessage, AIMessage
 from langgraph.graph import StateGraph, END
+from langchain.schema.runnable import RunnableLambda, RunnablePassthrough
+from langchain_community.tools import DuckDuckGoSearchRun
 
 # Load environment variables from .env file
 load_dotenv()
@@ -49,29 +51,26 @@ model=ChatGroq(model_name="gemma2-9b-it", api_key=os.getenv("GROQ_API_KEY"))
 # --- 3. Define the RAG Context and format docs ---
 def get_context(state: GraphState) -> str:
     """
-    Retrieves the context from the state.
+    Retrieves the context for a given question.
     """
+    question=state['question']
     embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-small-en")
-
-    loader=DirectoryLoader("./data",glob="./*.txt",loader_cls=TextLoader)
-    docs=loader.load()
-
-    text_splitter=RecursiveCharacterTextSplitter(
+    loader = DirectoryLoader("./data", glob="./*.txt", loader_cls=TextLoader)
+    docs = loader.load()
+    text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=200,
         chunk_overlap=50
     )
-    new_docs=text_splitter.split_documents(documents=docs)
-    db=FAISS.from_documents(new_docs, embeddings)
-    retriever=db.as_retriever(search_kwargs={"k": 2})
-    respose = retriever.invoke(state['question'])
-    
-    state.context = respose.page_content
-    state['messages'].append(AIMessage(content=f"RAG result: {respose}"))
-    # If the context is None, return an empty string
-    return state.context if state.context else ""
+    new_docs = text_splitter.split_documents(documents=docs)
+    db = FAISS.from_documents(new_docs, embeddings)
+    retriever = db.as_retriever(search_kwargs={"k": 2})
+    response = retriever.invoke(question)
+    state['context'] = format_docs(response)
+    return state["context"]
 
 def format_docs(docs):
     return "\n\n".join(doc.page_content for doc in docs)
+
 
 # --- 4. Define Nodes ---
 
@@ -149,32 +148,49 @@ def llm_node(state: GraphState) -> GraphState:
 # 4.3. RAG Node
 def rag_node(state: GraphState) -> GraphState:
     print("--- RAG NODE ---")
-    
-    # Find the rag_tool call, if any, and extract arguments
-    retriever = get_context(state) # Get context from the state
-     # After getting RAG data, we often want the LLM to synthesize it.
-    # So, the RAG node will typically transition to the LLM node.
+    # Build the prompt
     prompt = ChatPromptTemplate.from_messages([
         ("system", "You are a helpful assistant. Based on the following RAG context, answer the user's question:\n\n{context}"),
         HumanMessage(content=state['question'])
     ])
+      # Build the chain
     rag_chain = (
-        {"context": retriever | format_docs, "question": RunnablePassthrough()}
+        {
+            "context": RunnableLambda(lambda x: get_context(state)),
+            "question": RunnablePassthrough()
+        }
         | prompt
         | model
         | StrOutputParser()
     )
-    response = rag_chain.invoke({"context": state['context'], "question": state['question']})
-    state['generation'] = response.content
-    state['messages'].append(AIMessage(content=response.content))
-    print(f"LLM Generated (after RAG): {response.content}")
-
+    # Run the chain
+    response = rag_chain.invoke({"question": state['question']})
+    print(response)
+    state['generation'] = response
+    state['messages'].append(AIMessage(content=response))
+    print(f"LLM Generated (after RAG): {response}")
     return state
 
 # 4.4. Web Crawler Node
 def web_crawler_node(state: GraphState) -> GraphState:
     print("--- WEB CRAWLER NODE ---")
-    pass
+    search=DuckDuckGoSearchRun()
+    question = state['question']
+    if not question:
+        print("No question provided for web search.")
+        state['generation'] = "No question provided."
+        return state
+    try:
+        response = search.invoke(question)
+        state['generation'] = response
+        state['messages'].append(AIMessage(content=response))
+        print(f"Web Crawler Generated: {response}")
+    except Exception as e:
+        print(f"Web Crawler Error: {e}")
+        state['generation'] = "Web search failed."
+        state['messages'].append(AIMessage(content="Web search failed."))
+        
+    return state
 
 # 4.5. Validation Node
 def validation_node(state: GraphState) -> GraphState:
@@ -301,7 +317,7 @@ def run_pipeline(question: str):
 run_pipeline("What is the llm model name used?")
 
 # Modify rag_tool or validation_node to force a failure.
-run_pipeline("Tell me about the Battle of Gettysburg, but make sure to mention specific dates and key figures.")
+#run_pipeline("U.S. GDP – Size, Composition, and Global Share?")
 
 # Test Case 3: Web Crawler needed (simulated for current events)
 # This might fail validation if the web data is too generic.
